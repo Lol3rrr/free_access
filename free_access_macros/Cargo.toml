@@ -1,0 +1,15 @@
+[package]
+name = "free_access_macros"
+version = "0.1.0"
+edition = "2018"
+crate-type = "proc-macro"
+
+[lib]
+proc-macro = true
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+syn = { version = "1.0", features = ["full", "fold"] }
+proc-macro2 = { version = "1.0" }
+quote = "1.0"

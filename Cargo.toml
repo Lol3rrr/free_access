@@ -1,0 +1,5 @@
+[workspace]
+members = [
+	"free_access",
+	"free_access_macros",
+]

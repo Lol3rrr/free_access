@@ -1,0 +1,18 @@
+[package]
+name = "free_access"
+version = "0.1.0"
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+free_access_macros = { path = "./../free_access_macros" }
+
+thread_local = "1.1"
+crossbeam-queue = "0.3"
+lockfree = "0.5"
+memoffset = "0.6"
+tracing = { version = "0.1" }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.2" }
