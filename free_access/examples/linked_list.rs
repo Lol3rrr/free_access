@@ -1,4 +1,7 @@
-use std::sync::{atomic, Arc};
+use std::{
+    sync::{atomic, Arc},
+    time::Duration,
+};
 
 pub struct ListNode<T> {
     data: T,
@@ -94,10 +97,18 @@ impl<T> LinkedList<T> {
 fn main() {
     tracing_subscriber::fmt::init();
 
-    let list: LinkedList<u64> = LinkedList::new();
+    let list = Arc::new(LinkedList::new());
+
+    let c_l = list.clone();
+    let handle = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        c_l.append(15);
+    });
 
     list.append(13);
     list.append(14);
 
     list.allocator.force_gc();
+
+    handle.join().unwrap();
 }

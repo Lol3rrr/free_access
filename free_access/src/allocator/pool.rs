@@ -41,7 +41,7 @@
 //!         if Node.State == SET:
 //!             if !CAS(Node.State, SET, ACCESSED):
 //!                 continue
-//!             if Node.Phase != local_phase:
+//!             if Node.Phase == local_phase:
 //!                 Node.State = SET
 //!                 continue
 //!             if pool.Phase != local_phase:
@@ -107,7 +107,7 @@ struct Node<T> {
     data: UnsafeCell<MaybeUninit<T>>,
     state: atomic::AtomicU8,
     next: atomic::AtomicPtr<Self>,
-    // Add a phase counter
+    phase: atomic::AtomicU64,
 }
 
 impl<T> Node<T> {
@@ -116,6 +116,7 @@ impl<T> Node<T> {
             data: UnsafeCell::new(MaybeUninit::uninit()),
             state: atomic::AtomicU8::new(State::Empty.to_u8()),
             next: atomic::AtomicPtr::new(std::ptr::null_mut()),
+            phase: atomic::AtomicU64::new(0),
         }
     }
 
@@ -136,6 +137,12 @@ pub struct Pool<T> {
     start: *mut Node<T>,
 }
 
+#[derive(Debug, PartialEq)]
+pub enum PopError {
+    Empty,
+    InvalidPhase,
+}
+
 impl<T> Pool<T> {
     pub fn new() -> Self {
         let initial_node_ptr = Box::into_raw(Box::new(Node::new()));
@@ -146,6 +153,7 @@ impl<T> Pool<T> {
         }
     }
 
+    #[tracing::instrument(skip(self))]
     pub fn update_phase(&self, n_phase: u64) -> Result<(), ()> {
         let mut previous = self.phase.load(atomic::Ordering::Acquire);
         loop {
@@ -159,7 +167,9 @@ impl<T> Pool<T> {
                 atomic::Ordering::SeqCst,
                 atomic::Ordering::SeqCst,
             ) {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    return Ok(());
+                }
                 Err(cur) => {
                     previous = cur;
                 }
@@ -172,53 +182,84 @@ impl<T> Pool<T> {
             return Err(());
         }
 
-        let mut current = unsafe { &*self.start };
+        let mut latest = unsafe { &*self.start };
 
         // Attempt to find
-        loop {
-            if let State::Empty = current.load_state(atomic::Ordering::Acquire) {
-                match current.state.compare_exchange(
-                    State::Empty.to_u8(),
-                    State::Accessed.to_u8(),
-                    atomic::Ordering::SeqCst,
-                    atomic::Ordering::SeqCst,
-                ) {
-                    Ok(_) => {
-                        if self.phase.load(atomic::Ordering::Acquire) != phase {
-                            current
-                                .state
-                                .store(State::Empty.to_u8(), atomic::Ordering::Release);
-                            return Err(());
-                        }
+        for current_ptr in self.iter() {
+            let current = unsafe { &*current_ptr };
 
-                        let data_ptr = current.data.get() as *mut T;
-                        unsafe { data_ptr.write(data) };
+            match current.load_state(atomic::Ordering::Acquire) {
+                State::Empty => {
+                    if let Err(_) = current.state.compare_exchange(
+                        State::Empty.to_u8(),
+                        State::Accessed.to_u8(),
+                        atomic::Ordering::SeqCst,
+                        atomic::Ordering::SeqCst,
+                    ) {
+                        continue;
+                    }
 
+                    if self.phase.load(atomic::Ordering::Acquire) != phase {
+                        current
+                            .state
+                            .store(State::Empty.to_u8(), atomic::Ordering::Release);
+                        return Err(());
+                    }
+
+                    let data_ptr = current.data.get() as *mut T;
+                    unsafe { data_ptr.write(data) };
+
+                    current.phase.store(phase, atomic::Ordering::Release);
+
+                    current
+                        .state
+                        .store(State::Set.to_u8(), atomic::Ordering::Release);
+                    return Ok(());
+                }
+                State::Set => {
+                    let node_phase = current.phase.load(atomic::Ordering::Acquire);
+                    if node_phase >= phase {
+                        continue;
+                    }
+                    if let Err(_) = current.state.compare_exchange(
+                        State::Set.to_u8(),
+                        State::Accessed.to_u8(),
+                        atomic::Ordering::SeqCst,
+                        atomic::Ordering::SeqCst,
+                    ) {
+                        continue;
+                    }
+                    if self.phase.load(atomic::Ordering::Acquire) != phase {
                         current
                             .state
                             .store(State::Set.to_u8(), atomic::Ordering::Release);
-                        return Ok(());
+                        continue;
                     }
-                    Err(_) => {}
-                };
-            }
 
-            let next = current.next.load(atomic::Ordering::Acquire);
-            if next.is_null() {
-                break;
-            }
+                    let data_ptr = current.data.get();
+                    let old = unsafe { data_ptr.replace(MaybeUninit::new(data)) };
+                    drop(unsafe { old.assume_init() });
 
-            current = unsafe { &*next };
+                    current.phase.store(phase, atomic::Ordering::Release);
+                    current
+                        .state
+                        .store(State::Set.to_u8(), atomic::Ordering::Release);
+
+                    return Ok(());
+                }
+                _ => continue,
+            };
         }
 
         let next_node = Node::new();
         next_node
             .state
             .store(State::Accessed.to_u8(), atomic::Ordering::Release);
+        next_node.phase.store(phase, atomic::Ordering::Release);
         let next_ptr = Box::into_raw(Box::new(next_node));
 
         loop {
-            match current.next.compare_exchange(
+            match latest.next.compare_exchange(
                 std::ptr::null_mut(),
                 next_ptr,
                 atomic::Ordering::SeqCst,
@@ -236,54 +277,92 @@ impl<T> Pool<T> {
                     return Ok(());
                 }
                 Err(next) => {
-                    current = unsafe { &*next };
+                    latest = unsafe { &*next };
                 }
             };
         }
     }
 
-    pub fn pop(&self, phase: u64) -> Result<T, ()> {
+    pub fn pop(&self, phase: u64) -> Result<T, PopError> {
         if self.phase.load(atomic::Ordering::Acquire) != phase {
-            return Err(());
+            return Err(PopError::InvalidPhase);
         }
 
-        let mut current = unsafe { &*self.start };
-        loop {
+        for current_ptr in self.iter() {
+            let current = unsafe { &*current_ptr };
+
             if let State::Set = current.load_state(atomic::Ordering::Acquire) {
-                match current.state.compare_exchange(
+                if let Err(_) = current.state.compare_exchange(
                     State::Set.to_u8(),
                     State::Accessed.to_u8(),
                     atomic::Ordering::SeqCst,
                     atomic::Ordering::SeqCst,
                 ) {
-                    Ok(_) => {
-                        if self.phase.load(atomic::Ordering::Acquire) != phase {
-                            current
-                                .state
-                                .store(State::Set.to_u8(), atomic::Ordering::Release);
-                            return Err(());
-                        }
+                    continue;
+                }
 
-                        let data_ptr = current.data.get();
+                let pool_phase = self.phase.load(atomic::Ordering::Acquire);
+                let node_phase = current.phase.load(atomic::Ordering::Acquire);
+                if node_phase != pool_phase {
+                    let data_ptr = current.data.get();
+                    let old = unsafe { data_ptr.replace(MaybeUninit::uninit()) };
+                    drop(unsafe { old.assume_init() });
 
-                        let data = unsafe { data_ptr.read().assume_init() };
-                        unsafe { data_ptr.write(MaybeUninit::uninit()) };
+                    current
+                        .state
+                        .store(State::Empty.to_u8(), atomic::Ordering::Release);
+                    continue;
+                }
 
-                        return Ok(data);
-                    }
-                    Err(_) => {}
-                };
+                if pool_phase != phase {
+                    current
+                        .state
+                        .store(State::Set.to_u8(), atomic::Ordering::Release);
+                    return Err(PopError::InvalidPhase);
+                }
+
+                let data_ptr = current.data.get();
+
+                let data = unsafe { data_ptr.read().assume_init() };
+                unsafe { data_ptr.write(MaybeUninit::uninit()) };
+
+                current
+                    .state
+                    .store(State::Empty.to_u8(), atomic::Ordering::Release);
+
+                return Ok(data);
             }
-
-            let next_ptr = current.next.load(atomic::Ordering::Acquire);
-            if next_ptr.is_null() {
-                break;
-            }
-
-            current = unsafe { &*next_ptr };
         }
 
-        Err(())
+        Err(PopError::Empty)
+    }
+
+    fn iter(&self) -> ListIter<T> {
+        ListIter {
+            current: self.start,
+        }
+    }
+}
+
+unsafe impl<T> Send for Pool<T> {}
+unsafe impl<T> Sync for Pool<T> {}
+
+struct ListIter<T> {
+    current: *mut Node<T>,
+}
+impl<T> Iterator for ListIter<T> {
+    type Item = *mut Node<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current.is_null() {
+            return None;
+        }
+
+        let current_ptr = self.current;
+        let current = unsafe { &*current_ptr };
+
+        self.current = current.next.load(atomic::Ordering::Acquire);
+        Some(current_ptr)
     }
 }
 
@@ -328,5 +407,16 @@ mod tests {
         assert_eq!(Ok(()), pool.insert(13, 0));
 
         assert_eq!(Ok(13), pool.pop(0));
+    }
+
+    #[test]
+    fn insert_new_pop() {
+        let pool = Pool::<usize>::new();
+
+        assert_eq!(Ok(()), pool.insert(13, 0));
+
+        pool.update_phase(1).unwrap();
+        assert_eq!(Err(PopError::InvalidPhase), pool.pop(0));
+        assert_eq!(Err(PopError::Empty), pool.pop(1));
     }
 }

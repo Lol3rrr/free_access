@@ -135,6 +135,9 @@ impl<T> PageList<T> {
     }
 }
 
+unsafe impl<T> Send for PageList<T> {}
+unsafe impl<T> Sync for PageList<T> {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

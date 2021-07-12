@@ -6,7 +6,7 @@
 //!
 
 use allocator::PageList;
-pub use free_access_macros::freeaccess;
+pub use free_access_macros::*;
 use thread_local::ThreadLocal;
 
 use std::{
@@ -101,17 +101,22 @@ where
         tracing::debug!("Allocating");
 
         let local = self.local.get_or_default();
-        if local.alloc.is_empty() {
-            let lphase_index = local.phase_index.load(atomic::Ordering::Acquire);
+        for _ in 0..2 {
+            if local.alloc.is_empty() {
+                let lphase_index = local.phase_index.load(atomic::Ordering::Acquire);
+                tracing::debug!("Current Phase: {}", lphase_index);
 
-            match self.allocation_pool.pop(lphase_index) {
-                Ok(n_buffer) => {
-                    local.alloc.new_buffer(n_buffer);
-                }
-                Err(_) => {
-                    todo!()
-                }
-            };
+                match self.allocation_pool.pop(lphase_index) {
+                    Ok(n_buffer) => {
+                        local.alloc.new_buffer(n_buffer);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::debug!("Getting New-Pool: {:?}", e);
+                        self.reclaimation();
+                    }
+                };
+            }
         }
 
         let ptr = local.alloc.pop().unwrap();
@@ -126,11 +131,28 @@ where
     }
 
     /// TODO
-    pub fn restart(&self) {
+    pub fn restart(&self, local_ptrs: &[&mut *mut N]) {
         // TODO
         // Help reclaimation
+        self.reclaimation();
 
-        let locals = self.local.get_or_default();
+        let local = self.local.get_or_default();
+        let local_phase = local.phase_index.load(atomic::Ordering::Acquire);
+        local.dirty.update(
+            DirtyValue {
+                dirty: true,
+                phase: local_phase,
+            }
+            .to_u64(),
+            DirtyValue {
+                phase: local_phase,
+                dirty: false,
+            },
+        );
+
+        let ar = local.arbiter.get();
+        let hazard_frame = &local.hazard_ptr_frames[ar as usize];
+
         todo!()
     }
 
@@ -358,6 +380,10 @@ where
         tracing::debug!("Clearing Marks");
         let local = self.local.get_or_default();
         let local_phase = local.phase_index.load(atomic::Ordering::Acquire);
+
+        let sweep_chunk_index = (local_phase << 32) | 0x00;
+        self.sweep_chunk_index
+            .store(sweep_chunk_index, atomic::Ordering::Release);
 
         self.pages.update_marks(local_phase);
     }

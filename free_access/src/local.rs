@@ -36,6 +36,7 @@ impl<T> Default for Local<T> {
     }
 }
 
+#[must_use]
 pub enum MarkNodeState {
     Done,
     NotDone,

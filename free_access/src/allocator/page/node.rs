@@ -67,7 +67,6 @@ impl<T> PageNode<T> {
         let previous_marks_raw = self.marker.load(atomic::Ordering::Acquire);
         let previous_marks = NodeMarks::from(previous_marks_raw);
         if previous_marks.phase >= n_phase {
-            tracing::debug!("Previous Phase is newer");
             return;
         }
 

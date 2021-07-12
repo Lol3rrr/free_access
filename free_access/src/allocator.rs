@@ -13,7 +13,7 @@ impl<T> GlobalAllocPool<T> {
         }
     }
 
-    pub fn pop(&self, phase: u64) -> Result<AllocationBuffer<T>, ()> {
+    pub fn pop(&self, phase: u64) -> Result<AllocationBuffer<T>, pool::PopError> {
         self.pool.pop(phase)
     }
     pub fn insert(&self, phase: u64, data: AllocationBuffer<T>) -> Result<(), ()> {
